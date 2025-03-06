@@ -61,8 +61,6 @@ def generate_prompt(instruction, question, input_seg=None):
     else:
         return PROMPT_DICT["prompt_no_input"].format(instruction=instruction)
 
-outlist = []
-
 def flip():
     gc.collect()
     if device == 'cuda':
@@ -111,7 +109,7 @@ def compute_entropy_scipy(logits):
     entropy_values = [scipy.stats.entropy(row) for row in probabilities[0]]
     return entropy_values
 
-
+outlist = []
 for p in tqdm(prompts[:100]):
     try:
         prompt = generate_prompt(p["instruction"], p["question"], p["input"])
@@ -155,12 +153,14 @@ for p in tqdm(prompts[:100]):
         del post_output
         flip()
 
+        outlist.append(p)
+
     except Exception as e:
+        print("EXCEPTION!")
         import traceback
         print(traceback.format_exc())
         continue
 
-    outlist.append(p)
 
 import pickle
 import random
