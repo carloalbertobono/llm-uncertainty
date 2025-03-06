@@ -14,7 +14,7 @@ import os
 # TODO: normalizzazione entropia
 # TODO: check kuhn https://arxiv.org/pdf/2302.0966 https://arxiv.org/pdf/2307.10236
 
-access_token = os.environ['HF_TOKEN']
+if 'HF_TOKEN' in os.environ: access_token = os.environ['HF_TOKEN']
 
 # run params
 temperature=1.0
@@ -125,7 +125,7 @@ for p in tqdm(prompts[:100]):
         p["pre_output_proba_topk"] = get_topk_dict(pre_output)
         p["pre_output_true_entropies"] = compute_entropy_scipy(pre_output)
 
-        cleanup
+        # cleanup
         del pre_output
         flip()
 
