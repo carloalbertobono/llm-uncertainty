@@ -6,6 +6,7 @@ import json
 from tqdm import tqdm
 import gc
 import os
+import time
 
 # TODO: sample prompt (table length) + trim candidates to 10
 # TODO: command-line args
@@ -110,8 +111,10 @@ def compute_entropy_scipy(logits):
     return entropy_values
 
 outlist = []
-for p in tqdm(prompts[:100]):
+for p in tqdm(prompts):
     try:
+        start = time.time()
+
         prompt = generate_prompt(p["instruction"], p["question"], p["input"])
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
         with torch.no_grad():
@@ -152,6 +155,10 @@ for p in tqdm(prompts[:100]):
         # cleanup
         del post_output
         flip()
+
+        # processing time
+        end = time.time()
+        p['elapsed'] = end - start
 
         outlist.append(p)
 
