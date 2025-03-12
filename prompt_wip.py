@@ -137,6 +137,7 @@ for p in tqdm(prompts):
             top_p=top_p,
             output_scores=True,
             return_dict_in_generate=True,
+            output_logits=True,
             use_cache=use_cache
             )
 
@@ -144,7 +145,7 @@ for p in tqdm(prompts):
         post_output_sequences = post_output.sequences.cpu().detach().numpy().tolist()
         p["post_output_sequences"] = post_output_sequences
 
-        post_output_scores = [pp.cpu().detach() for pp in post_output.scores]
+        post_output_scores = [pp.cpu().detach() for pp in post_output.logits]
         post_output_scores = torch.stack(post_output_scores, dim=1)
         
         # top-n + top-k
