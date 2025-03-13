@@ -115,6 +115,8 @@ import pickle
 with open('selected_pids.688.pickle', 'rb') as handle:
     selected_pids = pickle.load(handle)
 
+NREP = 3 # multiple runs in generate
+
 outlist = []
 
 for pid, p in enumerate(tqdm(prompts)):
@@ -122,7 +124,6 @@ for pid, p in enumerate(tqdm(prompts)):
         start = time.time()
 
         if pid not in selected_pids: continue
-        print(pid)
 
         prompt = generate_prompt(p["instruction"], p["question"], p["input"])
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
@@ -139,31 +140,39 @@ for pid, p in enumerate(tqdm(prompts)):
         del pre_output
         flip()
 
-        post_output = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            output_scores=True,
-            return_dict_in_generate=True,
-            output_logits=True,
-            use_cache=use_cache
-            )
+        p["post_output_sequences"] = []
+        p["post_output_proba_topn"] = []
+        p["post_output_proba_topk"] = []
+        p["post_output_true_entropies"] = []
 
-        # sequence
-        post_output_sequences = post_output.sequences.cpu().detach().numpy().tolist()
-        p["post_output_sequences"] = post_output_sequences
+        for kk in range(NREP):
 
-        post_output_scores = [pp.cpu().detach() for pp in post_output.logits]
-        post_output_scores = torch.stack(post_output_scores, dim=1)
-        
-        # top-n + top-k
-        p["post_output_proba_topn"] = get_topn_dict(post_output_scores)
-        p["post_output_proba_topk"] = get_topk_dict(post_output_scores)
-        p["post_output_true_entropies"] = compute_entropy_scipy(post_output_scores)
+            post_output = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                output_scores=True,
+                return_dict_in_generate=True,
+                output_logits=True,
+                use_cache=use_cache
+                )
 
-        # cleanup
-        del post_output
+            # sequence
+            post_output_sequences = post_output.sequences.cpu().detach().numpy().tolist()
+            p["post_output_sequences"].append(post_output_sequences)
+
+            post_output_scores = [pp.cpu().detach() for pp in post_output.logits]
+            post_output_scores = torch.stack(post_output_scores, dim=1)
+            
+            # top-n + top-k
+            p["post_output_proba_topn"].append(get_topn_dict(post_output_scores))
+            p["post_output_proba_topk"].append(get_topk_dict(post_output_scores))
+            p["post_output_true_entropies"].append(compute_entropy_scipy(post_output_scores))
+
+            # cleanup
+            del post_output
+            
         flip()
 
         # processing time
