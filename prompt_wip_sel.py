@@ -115,7 +115,7 @@ import pickle
 with open('selected_pids.688.pickle', 'rb') as handle:
     selected_pids = pickle.load(handle)
 
-NREP = 3 # multiple runs in generate
+NREP = 4 # multiple runs in generate
 
 outlist = []
 
