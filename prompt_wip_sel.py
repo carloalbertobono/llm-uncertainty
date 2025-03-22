@@ -311,8 +311,6 @@ for pid, p in enumerate(tqdm(prompts)):
         print(traceback.format_exc())
         continue
 
-    break
-
 
 import pickle
 import random
