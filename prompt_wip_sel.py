@@ -8,12 +8,8 @@ import gc
 import os
 import time
 
-# TODO: sample prompt (table length) + trim candidates to 10
 # TODO: command-line args
 # TODO: save params with the run
-# TODO: logit lens (KL + IOU) for each layer of each token
-# TODO: normalizzazione entropia
-# TODO: check kuhn https://arxiv.org/pdf/2302.0966 https://arxiv.org/pdf/2307.10236
 
 if 'HF_TOKEN' in os.environ: access_token = os.environ['HF_TOKEN']
 
@@ -110,12 +106,84 @@ def compute_entropy_scipy(logits):
     entropy_values = [scipy.stats.entropy(row) for row in probabilities[0]]
     return entropy_values
 
+def get_layers_kl_div_mod(pre_output, model, precomp=None):
+    softmaxed_log = torch.log_softmax(pre_output, dim=-1)
+
+    kls = []
+    for k, l in enumerate(model.model.layers):
+        # print(softmaxed_log.shape, l.shape)
+        
+        # recover normalized from precomputed (if generated / hooks), or just read from network state
+        if precomp: 
+            mynorm = precomp[k]
+        else:
+            mynorm = l.mynorm
+        
+        l_ = l.unembed_matrix(mynorm)
+        softmaxed_l = torch.log_softmax(l_, dim=-1).cpu()
+        p = softmaxed_l[0]
+        q = softmaxed_log[0]
+        mykl = torch.nn.functional.kl_div(p, q, reduce=False, log_target=True).sum(dim=1)
+        # print(p.sum(), q.sum(), mykl.shape)
+        kls.append(mykl.detach().numpy())
+    return kls
+
+def jaccard_similarity(list1, list2):
+    intersection = len(set(list1) & set(list2))
+    union = len(set(list1)) + len(set(list2)) - intersection
+    return float(intersection) / union if union != 0 else 0.0
+
+def get_layers_iou_div_mod(pre_output_proba_topk, model, precomp=None):
+    
+    ious = []
+    
+    # for each layer
+    for k, l in enumerate(model.model.layers):
+        
+        # print(k)
+        # recover normalized from precomputed (if generated / hooks), or just read from network state
+        if precomp: 
+            mynorm = precomp[k]
+        else:
+            mynorm = l.mynorm
+        
+        l_ = l.unembed_matrix(mynorm).detach()
+        layer_topk = get_topn_dict(l_)
+        
+        # for each token
+        layer_ious = []
+        for a,b in zip(pre_output_proba_topk, layer_topk):
+            a = a['top_n_indices']
+            b = b['top_n_indices']   
+            layer_ious.append(jaccard_similarity(a,b))
+        ious.append(layer_ious)
+            
+    return ious
+
+class BlockOutputWrapper(torch.nn.Module):
+    def __init__(self, block, unembed_matrix, norm):
+        super().__init__()
+        self.block = block
+        self.unembed_matrix = unembed_matrix
+        self.norm = norm
+        self.mynorm = None
+
+    def forward(self, *args, **kwargs):
+        output = self.block(*args, **kwargs)
+        self.mynorm = self.norm(output[0])
+        # self.block_output_unembedded = self.unembed_matrix(self.norm(output[0]))
+        return output
+
+
+for i, layer in enumerate(model.model.layers):
+    model.model.layers[i] = BlockOutputWrapper(layer, model.lm_head, model.model.norm)
+
 # process only selected pickles
 import pickle
 with open('selected_pids.688.pickle', 'rb') as handle:
     selected_pids = pickle.load(handle)
 
-NREP = 4 # multiple runs in generate
+NREP = 5 # multiple runs in generate
 
 outlist = []
 
@@ -123,18 +191,27 @@ for pid, p in enumerate(tqdm(prompts)):
     try:
         start = time.time()
 
-        if pid not in selected_pids: continue
+        # subsetting data
+        if pid not in selected_pids: continue # focus on prompts where answer can be wrong
 
         prompt = generate_prompt(p["instruction"], p["question"], p["input"])
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        if inputs.input_ids.shape[1] > 2**12: continue # roughly 75%
         with torch.no_grad():
             pre_output = model(**inputs, use_cache=use_cache)
         pre_output = pre_output.logits.cpu().detach()
+
+        end = time.time()
+        p['elapsed_pre'] = end - start
 
         # top-n + top-k
         p["pre_output_proba_topn"] = get_topn_dict(pre_output)
         p["pre_output_proba_topk"] = get_topk_dict(pre_output)
         p["pre_output_true_entropies"] = compute_entropy_scipy(pre_output)
+
+        # logit lens KL/IOU
+        p["pre_output_layers_kl"] = get_layers_kl_div_mod(pre_output, model)
+        p["pre_output_layers_iou"] = get_layers_iou_div_mod(p["pre_output_proba_topn"], model)
 
         # cleanup
         del pre_output
@@ -147,6 +224,26 @@ for pid, p in enumerate(tqdm(prompts)):
 
         for kk in range(NREP):
 
+            generated_block_outputs = {i: [] for i in range(len(model.model.layers))}
+
+            def hook_fn(layer_idx):
+                def hook(module, input, output):
+                    if isinstance(output, tuple) and hasattr(module, "mynorm"):
+                        clo = module.mynorm.clone().detach()
+                        if clo.shape[1] > 1: 
+                            shpbf = clo.shape
+                            clo = clo[:,-1:,:]
+                            # print(shpbf, clo.shape)
+                        generated_block_outputs[layer_idx].append(clo)
+                return hook
+                
+            # register hooks
+            hooks = []
+
+            for i, layer in enumerate(model.model.layers):
+                hook = layer.register_forward_hook(hook_fn(i))
+                hooks.append(hook)
+
             post_output = model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
@@ -156,7 +253,16 @@ for pid, p in enumerate(tqdm(prompts)):
                 return_dict_in_generate=True,
                 output_logits=True,
                 use_cache=use_cache
-                )
+            )
+
+            # remove hooks
+            for hook in hooks:
+                hook.remove()
+
+            # accumulate norms at each generated token
+            for i in generated_block_outputs:
+                generated_block_outputs[i] = torch.stack(generated_block_outputs[i]).squeeze(1).permute(1, 0, 2)
+            generated_block_outputs = list(generated_block_outputs.values())
 
             # sequence
             post_output_sequences = post_output.sequences.cpu().detach().numpy().tolist()
@@ -170,12 +276,24 @@ for pid, p in enumerate(tqdm(prompts)):
             p["post_output_proba_topk"].append(get_topk_dict(post_output_scores))
             p["post_output_true_entropies"].append(compute_entropy_scipy(post_output_scores))
 
+            # logit lens KL/IOU
+            p["post_output_layers_kl"].append(get_layers_kl_div_mod(post_output_scores, model, generated_block_outputs))
+            p["post_output_layers_iou"].append(get_layers_iou_div_mod(p["post_output_proba_topn"], model, generated_block_outputs))
+
+            # transition scores
+            transition_scores_s = model.compute_transition_scores(post_output.sequences, post_output.scores, normalize_logits=True)
+            log_likelihoods_s = [score.item() for score in transition_scores_s[0]]
+            p["transition_scores_s"] = log_likelihoods_s
+            transition_scores_l = model.compute_transition_scores(post_output.sequences, post_output.logits, normalize_logits=True)
+            log_likelihoods_l = [score.item() for score in transition_scores_l[0]]
+            p["transition_scores_l"] = log_likelihoods_l
+
             # cleanup
             del post_output
             
         flip()
 
-        # processing time
+        # total processing time
         end = time.time()
         p['elapsed'] = end - start
         p['pid'] = pid
