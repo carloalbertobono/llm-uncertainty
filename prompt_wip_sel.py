@@ -210,8 +210,8 @@ for pid, p in enumerate(tqdm(prompts)):
         p["pre_output_true_entropies"] = compute_entropy_scipy(pre_output)
 
         # logit lens KL/IOU
-        p["pre_output_layers_kl"] = get_layers_kl_div_mod(pre_output, model)
-        p["pre_output_layers_iou"] = get_layers_iou_div_mod(p["pre_output_proba_topn"], model)
+        # p["pre_output_layers_kl"] = get_layers_kl_div_mod(pre_output, model)
+        # p["pre_output_layers_iou"] = get_layers_iou_div_mod(p["pre_output_proba_topn"], model)
 
         # cleanup
         del pre_output
@@ -221,6 +221,10 @@ for pid, p in enumerate(tqdm(prompts)):
         p["post_output_proba_topn"] = []
         p["post_output_proba_topk"] = []
         p["post_output_true_entropies"] = []
+        p["post_output_layers_kl"] = []
+        p["post_output_layers_iou"] = []
+        p["transition_scores_s"] = []
+        p["transition_scores_l"] = []
 
         for kk in range(NREP):
 
@@ -232,7 +236,7 @@ for pid, p in enumerate(tqdm(prompts)):
                         clo = module.mynorm.clone().detach()
                         if clo.shape[1] > 1: 
                             shpbf = clo.shape
-                            clo = clo[:,-1:,:]
+                            clo = clo[:,-1:,:] # first token returns all prompt tokens, patch last
                             # print(shpbf, clo.shape)
                         generated_block_outputs[layer_idx].append(clo)
                 return hook
@@ -272,21 +276,22 @@ for pid, p in enumerate(tqdm(prompts)):
             post_output_scores = torch.stack(post_output_scores, dim=1)
             
             # top-n + top-k
-            p["post_output_proba_topn"].append(get_topn_dict(post_output_scores))
+            mypost_topn = get_topn_dict(post_output_scores)
+            p["post_output_proba_topn"].append(mypost_topn)
             p["post_output_proba_topk"].append(get_topk_dict(post_output_scores))
             p["post_output_true_entropies"].append(compute_entropy_scipy(post_output_scores))
 
             # logit lens KL/IOU
             p["post_output_layers_kl"].append(get_layers_kl_div_mod(post_output_scores, model, generated_block_outputs))
-            p["post_output_layers_iou"].append(get_layers_iou_div_mod(p["post_output_proba_topn"], model, generated_block_outputs))
+            p["post_output_layers_iou"].append(get_layers_iou_div_mod(mypost_topn, model, generated_block_outputs))
 
             # transition scores
             transition_scores_s = model.compute_transition_scores(post_output.sequences, post_output.scores, normalize_logits=True)
             log_likelihoods_s = [score.item() for score in transition_scores_s[0]]
-            p["transition_scores_s"] = log_likelihoods_s
+            p["transition_scores_s"].append(log_likelihoods_s)
             transition_scores_l = model.compute_transition_scores(post_output.sequences, post_output.logits, normalize_logits=True)
             log_likelihoods_l = [score.item() for score in transition_scores_l[0]]
-            p["transition_scores_l"] = log_likelihoods_l
+            p["transition_scores_l"].append(log_likelihoods_l)
 
             # cleanup
             del post_output
@@ -305,6 +310,8 @@ for pid, p in enumerate(tqdm(prompts)):
         import traceback
         print(traceback.format_exc())
         continue
+
+    break
 
 
 import pickle
