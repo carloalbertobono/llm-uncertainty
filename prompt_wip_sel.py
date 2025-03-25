@@ -1,7 +1,8 @@
 import torch
 import torch.nn.functional as F
 import transformers
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, StaticCache
+import copy
 import json
 from tqdm import tqdm
 import gc
@@ -17,7 +18,7 @@ if 'HF_TOKEN' in os.environ: access_token = os.environ['HF_TOKEN']
 temperature=1.0
 top_p=0.9
 max_new_tokens=128
-use_cache=True
+# use_cache=True
 device = "mps"
 # dict size
 
@@ -32,7 +33,7 @@ with open(file_path, "r", encoding="utf-8") as f:
 
 config = transformers.AutoConfig.from_pretrained(model_name)
 orig_ctx_len = getattr(config, "max_position_embeddings", None)
-model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16).to(device)
+model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16).to(device)
 model.resize_token_embeddings(32001)
 tokenizer = AutoTokenizer.from_pretrained(model_name, model_max_length=orig_ctx_len, padding_side="left", use_fast=False)
 model.eval()
@@ -174,7 +175,6 @@ class BlockOutputWrapper(torch.nn.Module):
         # self.block_output_unembedded = self.unembed_matrix(self.norm(output[0]))
         return output
 
-
 for i, layer in enumerate(model.model.layers):
     model.model.layers[i] = BlockOutputWrapper(layer, model.lm_head, model.model.norm)
 
@@ -183,7 +183,8 @@ import pickle
 with open('selected_pids.688.pickle', 'rb') as handle:
     selected_pids = pickle.load(handle)
 
-NREP = 10 # multiple runs in generate
+NREP = 10 # number of multiple generate runs
+MAXTOK = 2**12 # maximum sequence length
 
 outlist = []
 
@@ -191,15 +192,31 @@ for pid, p in enumerate(tqdm(prompts)):
     try:
         start = time.time()
 
-        # subsetting data
+        # ( ! ) subsetting data
         if pid not in selected_pids: continue # focus on prompts where answer can be wrong
 
         prompt = generate_prompt(p["instruction"], p["question"], p["input"])
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        if inputs.input_ids.shape[1] > 2**12: continue # roughly 75%
+
+        # dirty trick for caching
+        prompt_ = prompt[:-1]
+        inputs_ = tokenizer(prompt_, return_tensors="pt").to(device)
+
+        # ( ! )
+        if inputs.input_ids.shape[1] > MAXTOK: 
+            print("SKIPPED")
+            continue # roughly 75% of data kept
+
+        prompt_cache = StaticCache(config=model.config, max_batch_size=1, 
+                           max_cache_len = MAXTOK, 
+                           device='mps', dtype=torch.bfloat16)
+        
         with torch.no_grad():
-            pre_output = model(**inputs, use_cache=use_cache)
-        pre_output = pre_output.logits.cpu().detach()
+            # pre_output = model(**inputs, use_cache=use_cache)
+            pre_output = model(**inputs_, past_key_values=prompt_cache, use_cache=False)
+            prompt_cache = pre_output.past_key_values
+
+        pre_output = pre_output.logits.detach().cpu()
 
         end = time.time()
         p['elapsed_pre'] = end - start
@@ -226,6 +243,7 @@ for pid, p in enumerate(tqdm(prompts)):
         p["transition_scores_s"] = []
         p["transition_scores_l"] = []
 
+        # NREP generate steps for each prompt
         for kk in range(NREP):
 
             generated_block_outputs = {i: [] for i in range(len(model.model.layers))}
@@ -256,7 +274,8 @@ for pid, p in enumerate(tqdm(prompts)):
                 output_scores=True,
                 return_dict_in_generate=True,
                 output_logits=True,
-                use_cache=use_cache
+                past_key_values=copy.deepcopy(prompt_cache),
+                use_cache=True 
             )
 
             # remove hooks
@@ -269,10 +288,10 @@ for pid, p in enumerate(tqdm(prompts)):
             generated_block_outputs = list(generated_block_outputs.values())
 
             # sequence
-            post_output_sequences = post_output.sequences.cpu().detach().numpy().tolist()
+            post_output_sequences = post_output.sequences.detach().cpu().numpy().tolist()
             p["post_output_sequences"].append(post_output_sequences)
 
-            post_output_scores = [pp.cpu().detach() for pp in post_output.logits]
+            post_output_scores = [pp.detach().cpu() for pp in post_output.logits]
             post_output_scores = torch.stack(post_output_scores, dim=1)
             
             # top-n + top-k
