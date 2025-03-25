@@ -17,7 +17,7 @@ if 'HF_TOKEN' in os.environ: access_token = os.environ['HF_TOKEN']
 # run params
 temperature=1.0
 top_p=0.9
-max_new_tokens=128
+max_new_tokens=64
 # use_cache=True
 device = "mps"
 # dict size
@@ -204,12 +204,11 @@ for pid, p in enumerate(tqdm(prompts)):
 
         # ( ! )
         if inputs.input_ids.shape[1] > MAXTOK: 
-            print("SKIPPED")
             continue # roughly 75% of data kept
 
         prompt_cache = StaticCache(config=model.config, max_batch_size=1, 
                            max_cache_len = MAXTOK, 
-                           device='mps', dtype=torch.bfloat16)
+                           device=device, dtype=torch.bfloat16)
         
         with torch.no_grad():
             # pre_output = model(**inputs, use_cache=use_cache)
@@ -305,6 +304,7 @@ for pid, p in enumerate(tqdm(prompts)):
             p["post_output_layers_iou"].append(get_layers_iou_div_mod(mypost_topn, model, generated_block_outputs))
 
             # transition scores
+            # https://github.com/jlko/semantic_uncertainty/blob/a8d9aa8cecd5f3bec09b19ae38ab13552e0846f4/semantic_uncertainty/uncertainty/models/huggingface_models.py
             transition_scores_s = model.compute_transition_scores(post_output.sequences, post_output.scores, normalize_logits=True)
             log_likelihoods_s = [score.item() for score in transition_scores_s[0]]
             p["transition_scores_s"].append(log_likelihoods_s)
