@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import transformers
-from transformers import AutoTokenizer, AutoModelForCausalLM, StaticCache
+from transformers import AutoTokenizer, AutoModelForCausalLM, StaticCache, DynamicCache
 import copy
 import json
 from tqdm import tqdm
@@ -184,7 +184,7 @@ with open('selected_pids.688.pickle', 'rb') as handle:
     selected_pids = pickle.load(handle)
 
 NREP = 10 # number of multiple generate runs
-MAXTOK = 2**12 # maximum sequence length
+MAXTOK = 2**12 + max_new_tokens # maximum sequence length
 
 outlist = []
 
@@ -206,13 +206,17 @@ for pid, p in enumerate(tqdm(prompts)):
         if inputs.input_ids.shape[1] > MAXTOK: 
             continue # roughly 75% of data kept
 
-        prompt_cache = StaticCache(config=model.config, max_batch_size=1, 
-                           max_cache_len = MAXTOK, 
-                           device=device, dtype=torch.bfloat16)
-        
+        #prompt_cache = StaticCache(config=model.config, max_batch_size=1, max_cache_len = MAXTOK, device=device, dtype=torch.bfloat16)
+        try: 
+            prompt_cache
+            del prompt_cache
+        except: 
+            pass
+        prompt_cache = DynamicCache()
+
         with torch.no_grad():
             # pre_output = model(**inputs, use_cache=use_cache)
-            pre_output = model(**inputs_, past_key_values=prompt_cache, use_cache=False)
+            pre_output = model(**inputs_, past_key_values=prompt_cache, use_cache=True)
             prompt_cache = pre_output.past_key_values
 
         pre_output = pre_output.logits.detach().cpu()
