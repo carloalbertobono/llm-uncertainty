@@ -31,7 +31,7 @@ def parse_args():
     parser.add_argument(
         "--input_file",
         type=str,
-        default="turl_test_2k_prompts_50.jsonl",
+        default="turl_test_2k_prompts_50_unique.jsonl",
         help="Path to input JSONL file",
     )
     parser.add_argument(
