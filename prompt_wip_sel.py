@@ -453,7 +453,7 @@ with torch.no_grad():
             print(traceback.format_exc())
             continue
 
-
+os.makedirs(args.output_dir, exist_ok=True)
 outfile = os.path.join(
     args.output_dir, f"{args.model_name.split('/')[-1]}.{str(random.randint(0, 2**32))}.pickle"
 )
