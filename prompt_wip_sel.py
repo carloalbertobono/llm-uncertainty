@@ -229,7 +229,7 @@ def get_layers_kl_div_mod(pre_output, model, precomp=None):
         q = softmaxed_log[0]
         mykl = torch.nn.functional.kl_div(p, q, reduce=False, log_target=True).sum(dim=1)
         # print(p.sum(), q.sum(), mykl.shape)
-        kls.append(mykl.detach().numpy())
+        kls.append(mykl.detach().cpu().float().numpy())
     return kls
 
 
@@ -385,7 +385,6 @@ with torch.no_grad():
                     past_key_values=copy.deepcopy(prompt_cache),
                     cache_implementation=None,
                     use_cache=True,
-                    disable_compile=True,
                     do_sample=True,
                 )
 
