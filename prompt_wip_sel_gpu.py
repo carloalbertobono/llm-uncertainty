@@ -2,6 +2,7 @@ import argparse
 import copy
 import gc
 import json
+import math
 import os
 import pickle
 import random
@@ -11,8 +12,12 @@ import scipy.stats
 import torch
 import torch.nn.functional as F
 import transformers
+from torch.nn.utils.rnn import pad_sequence
+from accelerate.utils import send_to_device
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+
+from llama_attn_replace import replace_llama_attn
 
 
 # Parse command-line arguments
@@ -25,7 +30,9 @@ def parse_args():
     parser.add_argument(
         "--model_name",
         type=str,
-        default="google/gemma-2-2b-it",
+        # default="google/gemma-2-2b-it",
+        default="osunlp/TableLlama",
+        # default="google/gemma-2-9b-it",
         help="Model ID from HuggingFace or local path",
     )
     parser.add_argument(
@@ -99,55 +106,10 @@ def parse_args():
     return args
 
 
-# Get arguments
-args = parse_args()
-
-# HuggingFace token
-if "HF_TOKEN" in os.environ:
-    access_token = os.environ["HF_TOKEN"]
-
-# Set device
-device = torch.device(args.device)
-
-# Load input data
-with open(args.input_file, "r", encoding="utf-8") as f:
-    prompts = [json.loads(line) for line in f]
-
-# Load model
-config = transformers.AutoConfig.from_pretrained(args.model_name)
-if args.model_name.startswith("osunlp"):
-    orig_ctx_len = getattr(config, "max_position_embeddings", None)
-    model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=args.torch_dtype).to(
-        device
-    )
-    model.resize_token_embeddings(32001)
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name, model_max_length=orig_ctx_len, padding_side="left", use_fast=False
-    )
-else:
-    model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=args.torch_dtype).to(
-        device
-    )
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-model.eval()
-
-# build prompts
-PROMPT_DICT = {
-    "prompt_input": (
-        "Below is an instruction that describes a task, paired with an input that provides further context. "
-        "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Input:\n{input_seg}\n\n### Question:\n{question}\n\n### Response:"
-    ),
-    "prompt_no_input": (
-        "Below is an instruction that describes a task. "
-        "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Response:"
-    ),
-}
-
-
 def generate_prompt(instruction, question, input_seg=None):
-    question += " Answer with just a candidate, selected from the provided referent entity candidates list, and nothing else. The selected candidate must be reported verbatim from the list provided as input. Each candidate in the list is enclosed between < and > and reports [DESC] and [TYPE] information."
+    question += " Answer with just a candidate, selected from the provided referent entity candidates list, and nothing else. "
+    "The selected candidate must be reported verbatim from the list provided as input. "
+    "Each candidate in the list is enclosed between < and > and reports [DESC] and [TYPE] information."
     if input_seg:
         return PROMPT_DICT["prompt_input"].format(
             instruction=instruction, input_seg=input_seg, question=question
@@ -166,7 +128,7 @@ def flip():
 
 
 # Update get_topk_dict to use args.topk
-def get_topk_dict(logits, k=args.topk):
+def get_topk_dict(logits, k=10):
     # Function remains the same, just using args.topk as default value
     probabilities = torch.softmax(logits, dim=-1)
     top_k_values, top_k_indices = torch.topk(logits, k=k, dim=-1)
@@ -195,8 +157,8 @@ def get_topn_dict(logits, threshold=0.9):
         n = top_n_lengths[0][i].item()
         batched_results.append(
             {
-                "top_n_probs": top_n_probs[0, i, :n].to(torch.float32), #.cpu().numpy().tolist(),
-                "top_n_indices": top_n_indices[0, i, :n].to(torch.float32) #.cpu().numpy().tolist(),
+                "top_n_probs": top_n_probs[0, i, :n].to(torch.float32),  # .cpu().tolist(),
+                "top_n_indices": top_n_indices[0, i, :n].to(torch.int),
             }
         )
 
@@ -208,22 +170,24 @@ def compute_entropy_scipy(logits):
     entropy_values = [scipy.stats.entropy(row).tolist() for row in probabilities[0]]
     return entropy_values
 
+
 # processes data on device, returns python list in ram
 def get_layers_kl_div_mod(pre_output, model, precomp=None):
-    softmaxed_log = torch.log_softmax(pre_output, dim=-1)
-
+    # pre_output: B x P x V
+    # precomp: L x B x P x D
     kls = []
+    softmaxed_log = torch.log_softmax(pre_output, dim=-1)
     for k, l in enumerate(model.model.layers):
+        if k == len(model.model.layers) - 1:
+            break
 
         # recover normalized from precomputed (if generated / hooks), or just read from network state
-        l_ = model.lm_head(model.model.norm(precomp[k])).detach()
-
-        softmaxed_l = torch.log_softmax(l_, dim=-1) # .cpu()
-        p = softmaxed_l[0]
-        q = softmaxed_log[0]
-        mykl = torch.nn.functional.kl_div(p, q, reduce=False, log_target=True).sum(dim=1)
-        # print(p.sum(), q.sum(), mykl.shape)
-        kls.append(mykl.detach().cpu().float().numpy().tolist())
+        l_ = model.lm_head(model.model.norm(precomp[k])).detach()  # B x P x V
+        softmaxed_l = torch.log_softmax(l_, dim=-1)
+        p = softmaxed_l[0]  # P x V
+        q = softmaxed_log[0]  # P x V
+        kl = torch.nn.functional.kl_div(p, q, reduction="none", log_target=True).sum(dim=1)  # P
+        kls.append(kl.detach().cpu().tolist())
     return kls
 
 
@@ -233,26 +197,52 @@ def jaccard_similarity(list1, list2):
     return float(intersection) / union if union != 0 else 0.0
 
 
-def get_layers_iou_div_mod(pre_output_proba_topk, model, precomp=None):
-
+def get_layers_iou_div_mod(pre_output_proba_topn, model, precomp=None, device="cuda"):
     ious = []
+    topn_full = torch.zeros(
+        len(pre_output_proba_topn), model.lm_head.weight.shape[0], device=device, dtype=torch.bool
+    )  # P x V
+    full_indices = [
+        (r, i.item())
+        for r, topn in enumerate(pre_output_proba_topn)
+        for i in topn["top_n_indices"]
+    ]
+    print("DIM", topn_full.shape)
+    print("INDICES", full_indices)
+    full_indices = torch.tensor(full_indices).t()
+    topn_full[full_indices[0], full_indices[1]] = 1
 
     # for each layer
     for k, l in enumerate(model.model.layers):
+        if k == len(model.model.layers) - 1:
+            break
 
         # recover normalized from precomputed (if generated / hooks), or just read from network state
         l_ = model.lm_head(model.model.norm(precomp[k])).detach()
         layer_topn = get_topn_dict(l_)
+        layer_topn_full = torch.zeros(
+            len(layer_topn), model.lm_head.weight.shape[0], device=device, dtype=torch.bool
+        )  # P x V
+        full_indices = [
+            (r, i.item()) for r, topn in enumerate(layer_topn) for i in topn["top_n_indices"]
+        ]
+        full_indices = torch.tensor(full_indices).t()
+        layer_topn_full[full_indices[0], full_indices[1]] = 1
 
-        # for each token
-        layer_ious = []
-        for a, b in zip(pre_output_proba_topk, layer_topn):
-            a = a["top_n_indices"]
-            b = b["top_n_indices"]
-            layer_ious.append(jaccard_similarity(a, b))
-        ious.append(layer_ious)
+        iou = torch.logical_and(topn_full, layer_topn_full).sum(dim=1) / torch.logical_or(
+            topn_full, layer_topn_full
+        ).sum(dim=1)
+        ious.append(iou.detach().cpu().tolist())
 
+        # # for each token
+        # layer_ious = []
+        # for a, b in zip(pre_output_proba_topn, layer_topn):
+        #     a = a["top_n_indices"]
+        #     b = b["top_n_indices"]
+        #     layer_ious.append(jaccard_similarity(a, b))
+        # ious.append(layer_ious)
     return ious
+
 
 def hook_fn(layer_idx, gen, in_generate=False):
     def hook(module, input, output):
@@ -265,6 +255,7 @@ def hook_fn(layer_idx, gen, in_generate=False):
 
     return hook
 
+
 class BlockOutputWrapper(torch.nn.Module):
     def __init__(self, block):
         super().__init__()
@@ -273,202 +264,291 @@ class BlockOutputWrapper(torch.nn.Module):
 
     def forward(self, *args, **kwargs):
         output = self.block(*args, **kwargs)
-        self.block_output = output[0] 
+        self.block_output = output[0]
         return output
 
 
-for i, layer in enumerate(model.model.layers):
-    model.model.layers[i] = BlockOutputWrapper(layer)
+# build prompts
+PROMPT_DICT = {
+    "prompt_input": (
+        "Below is an instruction that describes a task, paired with an input that provides further context. "
+        "Write a response that appropriately completes the request.\n\n"
+        "### Instruction:\n{instruction}\n\n### Input:\n{input_seg}\n\n### Question:\n{question}\n\n### Response:"
+    ),
+    "prompt_no_input": (
+        "Below is an instruction that describes a task. "
+        "Write a response that appropriately completes the request.\n\n"
+        "### Instruction:\n{instruction}\n\n### Response:"
+    ),
+}
 
-# Load selected PIDs
-with open(args.selected_pids_file, "rb") as handle:
-    selected_pids = pickle.load(handle)
+if __name__ == "__main__":
+    # Get arguments
+    args = parse_args()
 
-NREP = args.n_repetitions
-MAXTOK = args.max_tokens
+    # HuggingFace token
+    if "HF_TOKEN" in os.environ:
+        access_token = os.environ["HF_TOKEN"]
 
-outlist = []
-with torch.no_grad():
-    for pid, p in enumerate(tqdm(prompts)):
-        try:
-            start = time.perf_counter()
+    # Set device
+    device = torch.device(args.device)
 
-            # Replace conditional comments with argument checks
-            if pid not in selected_pids:
-                continue  # focus on prompts where answer can be wrong
+    # Load input data
+    with open(args.input_file, "r", encoding="utf-8") as f:
+        prompts = [json.loads(line) for line in f]
 
-            prompt = generate_prompt(p["instruction"], p["question"], p["input"])
-            inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    # Load model
+    if args.model_name.startswith("osunlp"):
+        replace_llama_attn()
 
-            # dirty trick for caching
-            prompt_ = prompt[:-1]
-            inputs_ = tokenizer(prompt_, return_tensors="pt").to(device)
+        # Set RoPE scaling factor
+        args.context_size = 8192
+        config = transformers.AutoConfig.from_pretrained(args.model_name)
 
-            # ( ! )
-            if inputs.input_ids.shape[1] > MAXTOK:
-                continue  # roughly 75% of data kept
+        orig_ctx_len = getattr(config, "max_position_embeddings", None)
+        if orig_ctx_len and args.context_size > orig_ctx_len:
+            scaling_factor = float(math.ceil(args.context_size / orig_ctx_len))
+            config.rope_scaling = {"type": "linear", "factor": scaling_factor}
 
-            prompt_cache = DynamicCache()
-            # attach hooks if needed
-            if args.compute_pre_kl or args.compute_pre_iou:
-                generated_block_pre = {i: [] for i in range(len(model.model.layers))}
-                hooks = []
-                for i, layer in enumerate(model.model.layers):
-                    hook = layer.register_forward_hook(hook_fn(i, generated_block_pre, in_generate=False))
-                    hooks.append(hook)
+        # Load model and tokenizer
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            config=config,
+            torch_dtype=args.torch_dtype,
+            device_map=device,
+        )
+        model.resize_token_embeddings(32001)
 
-            pre_output = model(**inputs_, past_key_values=prompt_cache, use_cache=True)
-            prompt_cache = pre_output.past_key_values
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            args.model_name,
+            model_max_length=(
+                args.context_size if args.context_size > orig_ctx_len else orig_ctx_len
+            ),
+            padding_side="left",
+            use_fast=False,
+        )
+    else:
+        config = transformers.AutoConfig.from_pretrained(args.model_name)
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name, torch_dtype=args.torch_dtype
+        ).to(device)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    model.eval()
 
-            # detach hooks if needed
-            if args.compute_pre_kl or args.compute_pre_iou:
-                for hook in hooks:
-                    hook.remove()
+    for i, layer in enumerate(model.model.layers):
+        model.model.layers[i] = BlockOutputWrapper(layer)
 
-                # accumulate norms at each generated token
-                for i in generated_block_pre:
-                    generated_block_pre[i] = (
-                        torch.stack(generated_block_pre[i]).squeeze(1).permute(1, 0, 2)
-                    )
-                generated_block_pre = list(generated_block_pre.values())
+    # Load selected PIDs
+    with open(args.selected_pids_file, "rb") as handle:
+        selected_pids = pickle.load(handle)
 
-            # top-n + top-k
-            p["pre_output_proba_topn"] = get_topn_dict(pre_output.logits)
-            p["pre_output_proba_topk"] = get_topk_dict(pre_output.logits)
-            p["pre_output_true_entropies"] = compute_entropy_scipy(pre_output.logits)
-            
-            # Add conditional execution of KL/IOU calculations based on args (compute before detaching)
-            if args.compute_pre_kl:
-                p["pre_output_layers_kl"] = get_layers_kl_div_mod(pre_output.logits, model, generated_block_pre)
-            
-            if args.compute_pre_iou:
-                p["pre_output_layers_iou"] = get_layers_iou_div_mod(p["pre_output_proba_topn"], model, generated_block_pre)
-            
-            # to python lists
-            for ty in p["pre_output_proba_topn"]:
-                ty['top_n_probs'] = ty['top_n_probs'].detach().cpu().numpy().tolist()
-                ty['top_n_indices'] = ty['top_n_indices'].detach().cpu().numpy().tolist()
-            p['pre_output_proba_topk']['top_k_probs'] = p['pre_output_proba_topk']['top_k_probs'].detach().cpu().float().numpy().tolist()
-            p['pre_output_proba_topk']['top_k_indices'] = p['pre_output_proba_topk']['top_k_indices'].detach().cpu().float().numpy().tolist()
+    NREP = args.n_repetitions
+    MAXTOK = args.max_tokens
 
-            # cleanup
-            del pre_output
-            flip()
+    outlist = []
+    with torch.no_grad():
+        for pid, p in enumerate(tqdm(prompts)):
+            try:
+                start = time.perf_counter()
 
-            p["post_output_sequences"] = []
-            p["post_output_proba_topn"] = []
-            p["post_output_proba_topk"] = []
-            p["post_output_true_entropies"] = []
-            p["post_output_layers_kl"] = []
-            p["post_output_layers_iou"] = []
-            p["transition_scores_s"] = []
-            p["transition_scores_l"] = []
+                # Replace conditional comments with argument checks
+                if pid not in selected_pids:
+                    continue  # focus on prompts where answer can be wrong
 
-            # NREP generate steps for each prompt
-            for kk in range(NREP):
+                prompt = generate_prompt(p["instruction"], p["question"], p["input"])
+                inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
-                print(kk)
+                # dirty trick for caching
+                prompt_ = prompt[:-1]
+                inputs_ = tokenizer(prompt_, return_tensors="pt").to(device)
 
-                generated_block_outputs = {i: [] for i in range(len(model.model.layers))}
+                # ( ! )
+                if inputs.input_ids.shape[1] > MAXTOK:
+                    continue  # roughly 75% of data kept
 
-                # register hooks
-                hooks = []
+                prompt_cache = DynamicCache()
+                # attach hooks if needed
+                if args.compute_pre_kl or args.compute_pre_iou:
+                    generated_block_pre = {i: [] for i in range(len(model.model.layers) - 1)}
+                    hooks = []
+                    for i, layer in enumerate(model.model.layers):
+                        if i == len(model.model.layers) - 1:
+                            break
+                        hook = layer.register_forward_hook(
+                            hook_fn(i, generated_block_pre, in_generate=False)
+                        )
+                        hooks.append(hook)
 
-                for i, layer in enumerate(model.model.layers):
-                    hook = layer.register_forward_hook(hook_fn(i, generated_block_outputs, in_generate=True))
-                    hooks.append(hook)
+                pre_output = model(**inputs_, past_key_values=prompt_cache, use_cache=True)
+                prompt_cache = pre_output.past_key_values
 
-                post_output = model.generate(
-                    **inputs,
-                    max_new_tokens=args.max_new_tokens,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                    output_scores=True,
-                    return_dict_in_generate=True,
-                    output_logits=True,
-                    past_key_values=copy.deepcopy(prompt_cache),
-                    cache_implementation=None,
-                    use_cache=True,
-                    do_sample=True,
-                )
+                # detach hooks if needed
+                if args.compute_pre_kl or args.compute_pre_iou:
+                    for hook in hooks:
+                        hook.remove()
 
-                # remove hooks
-                for hook in hooks:
-                    hook.remove()
-
-                # accumulate norms at each generated token
-                for i in generated_block_outputs:
-                    generated_block_outputs[i] = (
-                        torch.stack(generated_block_outputs[i]).squeeze(1).permute(1, 0, 2)
-                    )
-                generated_block_outputs = list(generated_block_outputs.values())
-
-                # sequence
-                post_output_sequences = post_output.sequences.detach().cpu().numpy().tolist()
-                p["post_output_sequences"].append(post_output_sequences)
-
-                post_output_scores = [pp for pp in post_output.logits]
-                post_output_scores = torch.stack(post_output_scores, dim=1)
+                    # accumulate norms at each generated token
+                    for i in generated_block_pre:
+                        generated_block_pre[i] = torch.cat(
+                            generated_block_pre[i], dim=0
+                        )  # B=1 x P x D
+                    generated_block_pre = list(generated_block_pre.values())
 
                 # top-n + top-k
-                mypost_topn = get_topn_dict(post_output_scores)
-                mypost_topk = get_topk_dict(post_output_scores)
-
-                p["post_output_true_entropies"].append(compute_entropy_scipy(post_output_scores))
-
-                # logit lens KL/IOU
-                p["post_output_layers_kl"].append(
-                    get_layers_kl_div_mod(post_output_scores, model, generated_block_outputs)
+                p["pre_output_proba_topn"] = get_topn_dict(
+                    pre_output.logits, threshold=args.topn_threshold
                 )
-                p["post_output_layers_iou"].append(
-                    get_layers_iou_div_mod(mypost_topn, model, generated_block_outputs)
-                )
-                
+                p["pre_output_proba_topk"] = get_topk_dict(pre_output.logits, k=args.topk)
+                p["pre_output_true_entropies"] = compute_entropy_scipy(pre_output.logits)
+
+                # Add conditional execution of KL/IOU calculations based on args (compute before detaching)
+                if args.compute_pre_kl:
+                    p["pre_output_layers_kl"] = get_layers_kl_div_mod(
+                        pre_output.logits, model, generated_block_pre
+                    )
+
+                if args.compute_pre_iou:
+                    p["pre_output_layers_iou"] = get_layers_iou_div_mod(
+                        p["pre_output_proba_topn"], model, generated_block_pre
+                    )
+
                 # to python lists
-                for ty in mypost_topn:
-                    ty['top_n_probs'] = ty['top_n_probs'].detach().cpu().numpy().tolist()
-                    ty['top_n_indices'] = ty['top_n_indices'].detach().cpu().numpy().tolist()
-                mypost_topk['top_k_probs'] = mypost_topk['top_k_probs'].detach().cpu().float().numpy().tolist()
-                mypost_topk['top_k_indices'] = mypost_topk['top_k_indices'].detach().cpu().float().numpy().tolist()
-                
-                p["post_output_proba_topn"].append(mypost_topn)
-                p["post_output_proba_topk"].append(mypost_topk)
-
-                # transition scores
-                # https://github.com/jlko/semantic_uncertainty/blob/a8d9aa8cecd5f3bec09b19ae38ab13552e0846f4/semantic_uncertainty/uncertainty/models/huggingface_models.py
-                transition_scores_s = model.compute_transition_scores(
-                    post_output.sequences, post_output.scores, normalize_logits=True
+                for ty in p["pre_output_proba_topn"]:
+                    ty["top_n_probs"] = ty["top_n_probs"].detach().cpu().tolist()
+                    ty["top_n_indices"] = ty["top_n_indices"].detach().cpu().tolist()
+                p["pre_output_proba_topk"]["top_k_probs"] = (
+                    p["pre_output_proba_topk"]["top_k_probs"].detach().cpu().tolist()
                 )
-                log_likelihoods_s = [score.item() for score in transition_scores_s[0]]
-                p["transition_scores_s"].append(log_likelihoods_s)
-                transition_scores_l = model.compute_transition_scores(
-                    post_output.sequences, post_output.logits, normalize_logits=True
+                p["pre_output_proba_topk"]["top_k_indices"] = (
+                    p["pre_output_proba_topk"]["top_k_indices"].detach().cpu().tolist()
                 )
-                log_likelihoods_l = [score.item() for score in transition_scores_l[0]]
-                p["transition_scores_l"].append(log_likelihoods_l)
 
                 # cleanup
-                del post_output
-          
-            flip()    
+                del pre_output
+                flip()
 
-            # total processing time
-            end = time.perf_counter()
-            p["elapsed"] = end - start
-            p["pid"] = pid
+                p["post_output_sequences"] = []
+                p["post_output_proba_topn"] = []
+                p["post_output_proba_topk"] = []
+                p["post_output_true_entropies"] = []
+                p["post_output_layers_kl"] = []
+                p["post_output_layers_iou"] = []
+                p["transition_scores_s"] = []
+                p["transition_scores_l"] = []
 
-            outlist.append(p)
+                # NREP generate steps for each prompt
+                for kk in range(NREP):
+                    generated_block_outputs = {i: [] for i in range(len(model.model.layers) - 1)}
 
-        except Exception as e:
-            print("EXCEPTION!")
-            import traceback
+                    # register hooks
+                    hooks = []
 
-            print(traceback.format_exc())
-            continue
+                    for i, layer in enumerate(model.model.layers):
+                        if i == len(model.model.layers) - 1:
+                            break
+                        hook = layer.register_forward_hook(
+                            hook_fn(i, generated_block_outputs, in_generate=True)
+                        )
+                        hooks.append(hook)
 
-os.makedirs(args.output_dir, exist_ok=True)
-outfile = os.path.join(
-    args.output_dir, f"{args.model_name.split('/')[-1]}.{str(random.randint(0, 2**32))}.pickle"
-)
-with open(outfile, "wb") as handle:
-    pickle.dump(outlist, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                    post_output = model.generate(
+                        **inputs,
+                        max_new_tokens=args.max_new_tokens,
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        output_scores=True,
+                        return_dict_in_generate=True,
+                        output_logits=True,
+                        past_key_values=copy.deepcopy(prompt_cache),
+                        cache_implementation=None,
+                        use_cache=True,
+                        do_sample=True,
+                    )
+
+                    # remove hooks
+                    for hook in hooks:
+                        hook.remove()
+
+                    # accumulate norms at each generated token
+                    for i in generated_block_outputs:
+                        # B=1 x P x D
+                        generated_block_outputs[i] = torch.cat(
+                            generated_block_outputs[i], dim=0
+                        ).transpose(0, 1)
+                    generated_block_outputs = list(generated_block_outputs.values())
+
+                    # sequence
+                    post_output_sequences = post_output.sequences.detach().cpu().tolist()
+                    p["post_output_sequences"].append(post_output_sequences)
+
+                    # Cat output logits
+                    post_output_scores = torch.cat(post_output.logits, dim=0).unsqueeze(
+                        0
+                    )  # B=1 x P x V
+
+                    # top-n + top-k
+                    mypost_topn = get_topn_dict(post_output_scores)
+                    mypost_topk = get_topk_dict(post_output_scores)
+
+                    p["post_output_true_entropies"].append(
+                        compute_entropy_scipy(post_output_scores)
+                    )
+
+                    # logit lens KL/IOU
+                    p["post_output_layers_kl"].append(
+                        get_layers_kl_div_mod(post_output_scores, model, generated_block_outputs)
+                    )
+                    # p["post_output_layers_iou"].append(
+                    #     get_layers_iou_div_mod(mypost_topn, model, generated_block_outputs)
+                    # )
+
+                    # to python lists
+                    for ty in mypost_topn:
+                        ty["top_n_probs"] = ty["top_n_probs"].detach().cpu().tolist()
+                        ty["top_n_indices"] = ty["top_n_indices"].detach().cpu().tolist()
+                    mypost_topk["top_k_probs"] = mypost_topk["top_k_probs"].detach().cpu().tolist()
+                    mypost_topk["top_k_indices"] = (
+                        mypost_topk["top_k_indices"].detach().cpu().tolist()
+                    )
+
+                    p["post_output_proba_topn"].append(mypost_topn)
+                    p["post_output_proba_topk"].append(mypost_topk)
+
+                    # transition scores
+                    # https://github.com/jlko/semantic_uncertainty/blob/a8d9aa8cecd5f3bec09b19ae38ab13552e0846f4/semantic_uncertainty/uncertainty/models/huggingface_models.py
+                    transition_scores_s = model.compute_transition_scores(
+                        post_output.sequences, post_output.scores, normalize_logits=True
+                    )
+                    log_likelihoods_s = [score.item() for score in transition_scores_s[0]]
+                    p["transition_scores_s"].append(log_likelihoods_s)
+                    transition_scores_l = model.compute_transition_scores(
+                        post_output.sequences, post_output.logits, normalize_logits=True
+                    )
+                    log_likelihoods_l = [score.item() for score in transition_scores_l[0]]
+                    p["transition_scores_l"].append(log_likelihoods_l)
+
+                    # cleanup
+                    del post_output
+
+                # total processing time
+                end = time.perf_counter()
+                p["elapsed"] = end - start
+                p["args"] = vars(args)
+                p["pid"] = pid
+
+                os.makedirs(args.output_dir, exist_ok=True)
+                outfile = os.path.join(
+                    args.output_dir,
+                    f"{args.model_name.split('/')[-1]}.{str(random.randint(0, 2**32))}.pickle",
+                )
+                with open(outfile, "wb") as handle:
+                    pickle.dump(p, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+                del p
+                flip()
+            except Exception as e:
+                print("EXCEPTION!")
+                import traceback
+
+                print(traceback.format_exc())
+                continue
