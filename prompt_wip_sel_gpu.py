@@ -31,8 +31,8 @@ def parse_args():
         "--model_name",
         type=str,
         # default="google/gemma-2-2b-it",
-        default="osunlp/TableLlama",
-        # default="google/gemma-2-9b-it",
+        #default="osunlp/TableLlama",
+        default="google/gemma-2-9b-it",
         help="Model ID from HuggingFace or local path",
     )
     parser.add_argument(
@@ -107,9 +107,7 @@ def parse_args():
 
 
 def generate_prompt(instruction, question, input_seg=None):
-    question += " Answer with just a candidate, selected from the provided referent entity candidates list, and nothing else. "
-    "The selected candidate must be reported verbatim from the list provided as input. "
-    "Each candidate in the list is enclosed between < and > and reports [DESC] and [TYPE] information."
+    question += " Answer with just a candidate, selected from the provided referent entity candidates list, and nothing else. The selected candidate must be reported verbatim from the list provided as input. Each candidate in the list is enclosed between < and > and reports [DESC] and [TYPE] information."
     if input_seg:
         return PROMPT_DICT["prompt_input"].format(
             instruction=instruction, input_seg=input_seg, question=question
@@ -207,8 +205,8 @@ def get_layers_iou_div_mod(pre_output_proba_topn, model, precomp=None, device="c
         for r, topn in enumerate(pre_output_proba_topn)
         for i in topn["top_n_indices"]
     ]
-    print("DIM", topn_full.shape)
-    print("INDICES", full_indices)
+    #print("DIM", topn_full.shape)
+    #print("INDICES", full_indices)
     full_indices = torch.tensor(full_indices).t()
     topn_full[full_indices[0], full_indices[1]] = 1
 
@@ -328,11 +326,11 @@ if __name__ == "__main__":
             use_fast=False,
         )
     else:
-        config = transformers.AutoConfig.from_pretrained(args.model_name)
+        config = transformers.AutoConfig.from_pretrained(args.model_name, token=access_token)
         model = AutoModelForCausalLM.from_pretrained(
-            args.model_name, torch_dtype=args.torch_dtype
+            args.model_name, torch_dtype=args.torch_dtype, token=access_token
         ).to(device)
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name, token=access_token)
     model.eval()
 
     for i, layer in enumerate(model.model.layers):
