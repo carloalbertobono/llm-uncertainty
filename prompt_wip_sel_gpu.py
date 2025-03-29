@@ -356,6 +356,9 @@ if __name__ == "__main__":
                 prompt = generate_prompt(p["instruction"], p["question"], p["input"])
                 inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
+                p["prompt"] = prompt
+                p["tokenized_inputs"] = inputs
+
                 # dirty trick for caching
                 prompt_ = prompt[:-1]
                 inputs_ = tokenizer(prompt_, return_tensors="pt").to(device)
