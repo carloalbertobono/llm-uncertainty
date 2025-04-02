@@ -17,8 +17,6 @@ from accelerate.utils import send_to_device
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
-from llama_attn_replace import replace_llama_attn
-
 
 # Parse command-line arguments
 def parse_args():
@@ -30,9 +28,9 @@ def parse_args():
     parser.add_argument(
         "--model_name",
         type=str,
-        # default="google/gemma-2-2b-it",
-        #default="osunlp/TableLlama",
-        default="google/gemma-2-9b-it",
+        default="google/gemma-2-2b-it",
+        # default="osunlp/TableLlama",
+        # default="google/gemma-2-9b-it",
         help="Model ID from HuggingFace or local path",
     )
     parser.add_argument(
@@ -285,6 +283,7 @@ if __name__ == "__main__":
     args = parse_args()
 
     # HuggingFace token
+    access_token = None
     if "HF_TOKEN" in os.environ:
         access_token = os.environ["HF_TOKEN"]
 
@@ -297,6 +296,7 @@ if __name__ == "__main__":
 
     # Load model
     if args.model_name.startswith("osunlp"):
+        from llama_attn_replace import replace_llama_attn
         replace_llama_attn()
 
         # Set RoPE scaling factor
@@ -360,8 +360,8 @@ if __name__ == "__main__":
                 p["tokenized_inputs"] = inputs
 
                 # dirty trick for caching
-                prompt_ = prompt[:-1]
-                inputs_ = tokenizer(prompt_, return_tensors="pt").to(device)
+                # prompt_ = prompt[:-1]
+                # inputs_ = tokenizer(prompt_, return_tensors="pt").to(device)
 
                 # ( ! )
                 if inputs.input_ids.shape[1] > MAXTOK:
@@ -380,7 +380,7 @@ if __name__ == "__main__":
                         )
                         hooks.append(hook)
 
-                pre_output = model(**inputs_, past_key_values=prompt_cache, use_cache=True)
+                pre_output = model(**inputs, past_key_values=prompt_cache, use_cache=True)
                 prompt_cache = pre_output.past_key_values
 
                 # detach hooks if needed
@@ -452,6 +452,12 @@ if __name__ == "__main__":
                         )
                         hooks.append(hook)
 
+                    # cache crippling
+                    cache = copy.deepcopy(prompt_cache)
+                    for i in range(len(cache.key_cache)):
+                        cache.key_cache[i] = cache.key_cache[i][:, :, :-1, :]
+                        cache.value_cache[i] = cache.value_cache[i][:, :, :-1, :]
+
                     post_output = model.generate(
                         **inputs,
                         max_new_tokens=args.max_new_tokens,
@@ -460,7 +466,7 @@ if __name__ == "__main__":
                         output_scores=True,
                         return_dict_in_generate=True,
                         output_logits=True,
-                        past_key_values=copy.deepcopy(prompt_cache),
+                        past_key_values=cache,
                         cache_implementation=None,
                         use_cache=True,
                         do_sample=True,
