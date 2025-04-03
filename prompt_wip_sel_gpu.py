@@ -166,6 +166,11 @@ def compute_entropy_scipy(logits):
     entropy_values = [scipy.stats.entropy(row).tolist() for row in probabilities[0]]
     return entropy_values
 
+def compute_entropy_scipy_device(logits):
+    probabilities = torch.softmax(pre_output.logits, dim=-1)
+    entropy = -torch.sum(probabilities * torch.log(probabilities), dim=-1)
+    return entropy[0].detach().cpu().tolist()
+
 
 # processes data on device, returns python list in ram
 def get_layers_kl_div_mod(pre_output, model, precomp=None):
