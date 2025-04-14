@@ -14,9 +14,10 @@ import torch.nn.functional as F
 import transformers
 from torch.nn.utils.rnn import pad_sequence
 from accelerate.utils import send_to_device
-from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
+# execute in a loop
+# for temp in $(seq 0.1 0.1 1.0); do echo $temp; mkdir -p output_temperature_$temp; python prompt_fast.py --selected_pids_file temperature.pids.pickle --model osunlp/TableLlama --temperature $temp --device cuda --output_dir output_temperature_$temp; done
 
 # Parse command-line arguments
 def parse_args():
@@ -105,6 +106,9 @@ def generate_prompt(instruction, question, input_seg=None):
 
 def flip():
     gc.collect()
+    if device == "mps":
+        torch.mps.synchronize()
+        torch.mps.empty_cache()
     if device == "cuda":
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
@@ -187,10 +191,11 @@ if __name__ == "__main__":
 
     NREP = args.n_repetitions
     MAXTOK = args.max_tokens
+    abs_start = time.perf_counter()
 
-    outlist = []
     with torch.no_grad():
-        for pid, p in enumerate(tqdm(prompts)):
+        for pid, p in enumerate(prompts):
+            print(f"Processing {pid+1}/{len(prompts)} {time.perf_counter()-abs_start}s", end='\r')
             try:
                 start = time.perf_counter()
 
@@ -203,14 +208,6 @@ if __name__ == "__main__":
 
                 p["prompt"] = prompt
                 p["tokenized_inputs"] = inputs
-
-                # dirty trick for caching
-                # prompt_ = prompt[:-1]
-                # inputs_ = tokenizer(prompt_, return_tensors="pt").to(device)
-
-                # ( ! )
-                if inputs.input_ids.shape[1] > MAXTOK:
-                    continue  # roughly 75% of data kept
 
                 prompt_cache = DynamicCache()
 
