@@ -194,15 +194,16 @@ if __name__ == "__main__":
     abs_start = time.perf_counter()
 
     with torch.no_grad():
+        cur = 0
         for pid, p in enumerate(prompts):
-            print(f"Processing {pid+1}/{len(prompts)} {time.perf_counter()-abs_start}s", end='\r')
+            print(f"Processing {pid+1}/{len(prompts)} {cur} {time.perf_counter()-abs_start}s", end='\r')
             try:
                 start = time.perf_counter()
 
                 # Replace conditional comments with argument checks
                 if pid not in selected_pids:
                     continue  # focus on prompts where answer can be wrong
-
+                cur += 1
                 prompt = generate_prompt(p["instruction"], p["question"], p["input"])
                 inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
@@ -222,16 +223,26 @@ if __name__ == "__main__":
                 p["transition_scores_s"] = []
                 p["transition_scores_l"] = []
 
+                end = time.perf_counter()
+                p["elapsed_forward"] = end - start
+
+                copytime = 0
+                generatetime = 0
+
                 # NREP generate steps for each prompt
                 for kk in range(NREP):
                     generated_block_outputs = {i: [] for i in range(len(model.model.layers) - 1)}
 
                     # cache crippling
+                    copystart = time.perf_counter()
                     cache = copy.deepcopy(prompt_cache)
                     for i in range(len(cache.key_cache)):
                         cache.key_cache[i] = cache.key_cache[i][:, :, :-1, :]
                         cache.value_cache[i] = cache.value_cache[i][:, :, :-1, :]
+                    copyend = time.perf_counter()
+                    copytime += copyend - copystart
 
+                    generatestart = time.perf_counter()
                     post_output = model.generate(
                         **inputs,
                         max_new_tokens=args.max_new_tokens,
@@ -245,6 +256,8 @@ if __name__ == "__main__":
                         use_cache=True,
                         do_sample=True,
                     )
+                    generateend = time.perf_counter()
+                    generatetime += generateend - generatestart
 
                     # sequence
                     post_output_sequences = post_output.sequences.detach().cpu().tolist()
@@ -269,6 +282,8 @@ if __name__ == "__main__":
                 # total processing time
                 end = time.perf_counter()
                 p["elapsed"] = end - start
+                p["elapsed_copytime"] = copytime
+                p["elapsed_generatetime"] = generatetime
                 p["args"] = vars(args)
                 p["pid"] = pid
 
